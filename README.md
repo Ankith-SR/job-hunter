@@ -68,7 +68,7 @@ Scrapes job listings from LinkedIn and Handshake, scores them against your resum
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/job-hunter.git
+git clone https://github.com/Ankith-SR/job-hunter.git
 cd job-hunter
 python -m venv .venv
 

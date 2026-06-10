@@ -1,0 +1,29 @@
+# Environment & secrets
+.env
+utils/profile.json
+credentials.json
+output/gmail_token.json
+
+# Output (generated per-run — don't commit)
+output/
+logs/run.log
+
+# Committed but should not be overwritten
+!logs/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Browser session (v1 legacy)
+output/browser_session/
+
+# OS
+.DS_Store
+Thumbs.db

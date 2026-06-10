@@ -1,0 +1,19 @@
+# Core
+python-dotenv
+httpx
+
+# LLM client (OpenAI-compatible)
+openai
+
+# Scraping
+apify-client
+
+# Resume PDF rendering
+reportlab
+pdfplumber
+
+# Gmail API (optional — for saving email drafts to Gmail)
+# If you skip Gmail setup, drafts are saved as .eml files instead
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib

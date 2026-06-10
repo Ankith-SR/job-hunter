@@ -1,0 +1,16 @@
+{
+  "searchTerms": [
+    "software engineer intern",
+    "software developer intern",
+    "data analyst intern",
+    "machine learning intern",
+    "full stack intern",
+    "data science intern",
+    "part time software engineer"
+  ],
+  "location": "Phoenix AZ",
+  "handshakeJobTypes": ["internship", "part time"],
+  "handshakeDateRange": 7,
+  "maxResults": 1,
+  "salaryMin": null
+}

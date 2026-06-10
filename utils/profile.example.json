@@ -1,0 +1,22 @@
+{
+  "first_name":    "Jane",
+  "last_name":     "Doe",
+  "full_name":     "Jane Doe",
+  "email":         "jane@university.edu",
+  "phone":         "6025551234",
+  "phone_display": "602-555-1234",
+  "linkedin":      "https://linkedin.com/in/jane-doe",
+  "location":      "Tempe, AZ",
+  "city":          "Tempe",
+  "state_full":    "Arizona",
+  "country":       "United States",
+  "zip":           "85281",
+  "university":    "Arizona State University",
+  "degree":        "M.S. Computer Science",
+  "major":         "Computer Science",
+  "grad_year":     "2027",
+  "authorized":    "Yes",
+  "sponsorship":   "No",
+  "veteran":       "I am not a protected veteran",
+  "disability":    "I do not have a disability"
+}

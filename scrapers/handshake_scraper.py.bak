@@ -1,0 +1,388 @@
+# scrapers/handshake_scraper.py
+import json
+import logging
+import random
+import time
+from pathlib import Path
+from typing import List, Dict, Optional
+
+import httpx
+from playwright.async_api import async_playwright, BrowserContext
+
+from utils.session_manager import SessionManager
+
+log = logging.getLogger(__name__)
+
+
+class HandshakeScraper:
+    """
+    Handshake scraper with robust Cloudflare handling:
+      - Reuses a single Playwright BrowserContext for the whole scrape run
+      - Warms the session (visit root/jobs) so Cloudflare JS challenge is executed
+      - Uses browser-context requests for API calls (context.request)
+      - Throttles and backoffs on 403/Cloudflare
+      - Falls back to DOM scraping only if API cannot return job data
+    """
+
+    BASE_URL = "https://app.joinhandshake.com"
+    session_name = "handshake"
+
+    def __init__(self):
+        self.cookies: Optional[httpx.Cookies] = None
+        self.csrf_token: Optional[str] = None
+        # single context reused across keywords (set in scrape())
+        self._shared_context: Optional[BrowserContext] = None
+
+    # -------------------------
+    # Helpers
+    # -------------------------
+    def _is_cloudflare_challenge(self, text: str) -> bool:
+        if not text:
+            return False
+        lower = text.lower()
+        return "just a moment" in lower or "challenges.cloudflare.com" in lower or "cf-chl-bypass" in lower
+
+    def _log_cf_info(self, resp_text: str):
+        snippet = (resp_text or "")[:1000]
+        log.warning("[Handshake][CF] Body snippet:\n%s", snippet)
+
+    # -------------------------
+    # Load cookies + CSRF (best-effort)
+    # -------------------------
+    async def _load_cookies_from_browser(self, context: BrowserContext):
+        """
+        Populate self.cookies and self.csrf_token from an existing BrowserContext.
+        Caller must provide a context (we reuse the shared context).
+        """
+        try:
+            raw_cookies = await context.cookies()
+        except Exception:
+            raw_cookies = []
+
+        jar = httpx.Cookies()
+        for c in raw_cookies:
+            domain = c.get("domain") or "app.joinhandshake.com"
+            jar.set(name=c["name"], value=c["value"], domain=domain, path=c.get("path", "/"))
+
+        self.cookies = jar
+
+        # Try to extract CSRF token from page/localStorage
+        csrf = None
+        try:
+            page = context.pages[0] if context.pages else await context.new_page()
+            try:
+                await page.goto(f"{self.BASE_URL}/", wait_until="domcontentloaded", timeout=10000)
+            except Exception:
+                pass
+            try:
+                csrf = await page.evaluate(
+                    """() => {
+                        const m = document.querySelector('meta[name="csrf-token"]');
+                        if (m && m.content) return m.content;
+                        try { if (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.csrfToken) return window.__INITIAL_STATE__.csrfToken; } catch(e){}
+                        try {
+                            const keys = ['csrfToken','csrf_token','X-CSRF-Token','csrftoken'];
+                            for (const k of keys) {
+                                const v = localStorage.getItem(k);
+                                if (v) return v;
+                            }
+                        } catch(e){}
+                        return null;
+                    }"""
+                )
+            except Exception:
+                csrf = None
+        except Exception:
+            csrf = None
+
+        if not csrf:
+            for c in raw_cookies:
+                if c.get("name", "").lower() in ("csrf", "csrf_token", "x-csrf-token", "csrftoken"):
+                    csrf = c.get("value")
+                    break
+
+        self.csrf_token = csrf or None
+        log.debug("[Handshake] Loaded cookies and csrf present=%s", bool(self.csrf_token))
+
+    # -------------------------
+    # Warm the session once
+    # -------------------------
+    async def _warm_session(self, context: BrowserContext):
+        """
+        Visit the root and a jobs page to ensure Cloudflare challenge is executed
+        and solved in the browser. This should be called once per scrape run.
+        """
+        try:
+            page = context.pages[0] if context.pages else await context.new_page()
+            # Visit root to let Cloudflare run
+            await page.goto(f"{self.BASE_URL}/", wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(800)  # small pause
+            # Visit a jobs page to ensure the jobs API is reachable from the browser
+            await page.goto(f"{self.BASE_URL}/jobs?query=software+engineer+intern", wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(800)
+            html = await page.content()
+            if self._is_cloudflare_challenge(html):
+                log.warning("[Handshake] Warm step shows Cloudflare challenge in browser. Please solve it in the opened browser if running interactive.")
+            else:
+                log.info("[Handshake] Warm step completed; browser context appears warmed.")
+        except Exception as e:
+            log.warning("[Handshake] Warm step failed: %s", e)
+
+    # -------------------------
+    # Browser-context API fetch (preferred)
+    # -------------------------
+    async def _browser_context_fetch(self, context: BrowserContext, url: str) -> Optional[object]:
+        """
+        Use Playwright's context.request to perform the GET from the browser context.
+        Returns a small response-like object with .status_code and .text and .json()
+        """
+        try:
+            req_ctx = context.request
+            r = await req_ctx.get(url)
+            status = r.status
+            text = await r.text()
+            class SimpleResp:
+                def __init__(self, status_code, text):
+                    self.status_code = status_code
+                    self._text = text
+                def json(self):
+                    try:
+                        return json.loads(self._text)
+                    except Exception:
+                        return {}
+                @property
+                def text(self):
+                    return self._text
+            return SimpleResp(status, text)
+        except Exception as e:
+            log.warning("[Handshake] browser-context fetch error: %s", e)
+            return None
+
+    # -------------------------
+    # API request flow with backoff and browser fallback
+    # -------------------------
+    async def _api_request(self, context: BrowserContext, url: str, max_retries: int = 2) -> Optional[object]:
+        """
+        Try browser-context fetch (preferred). If Cloudflare is detected, perform
+        exponential backoff and optionally open visible browser once for manual solve.
+        """
+        attempt = 0
+        backoff = 1.0
+        last_resp = None
+
+        while attempt <= max_retries:
+            attempt += 1
+            log.debug("[Handshake] API attempt %d for %s", attempt, url)
+            resp = await self._browser_context_fetch(context, url)
+            last_resp = resp
+            if resp is None:
+                log.warning("[Handshake] browser-context fetch returned None; sleeping then retrying")
+            else:
+                # If 200 and not Cloudflare, return
+                if resp.status_code == 200 and not self._is_cloudflare_challenge(resp.text):
+                    return resp
+                # If Cloudflare or 403/401, log and backoff
+                log.warning("[Handshake] API returned %s on attempt %d", getattr(resp, "status_code", "ERR"), attempt)
+                if self._is_cloudflare_challenge(getattr(resp, "text", "")):
+                    self._log_cf_info(resp.text)
+                else:
+                    # log snippet for non-CF 403/401
+                    self._log_cf_info(getattr(resp, "text", ""))
+            # backoff before next attempt
+            sleep_for = backoff + random.uniform(0.2, 0.8)
+            log.debug("[Handshake] Backing off %.2fs before retry", sleep_for)
+            await context.wait_for_timeout(int(sleep_for * 1000))
+            backoff *= 2.0
+
+        # After retries, if still blocked, open visible browser once for manual solve
+        try:
+            log.warning("[Handshake] Still blocked after retries — opening visible browser for manual solve.")
+            vis_ctx = await SessionManager.get_context(self.session_name, headless=False)
+            try:
+                page = vis_ctx.pages[0] if vis_ctx.pages else await vis_ctx.new_page()
+                await page.goto(url, wait_until="networkidle", timeout=60000)
+                html = await page.content()
+                if self._is_cloudflare_challenge(html):
+                    log.warning("[Handshake] Please solve the Cloudflare challenge in the opened browser window. Press Enter here when done.")
+                    input()  # block until user confirms
+                    # after manual solve, try browser-context fetch again (headless)
+                    await SessionManager.close_context(vis_ctx)
+                    # small pause to let cookies propagate
+                    await context.wait_for_timeout(1000)
+                    resp2 = await self._browser_context_fetch(context, url)
+                    if resp2 and resp2.status_code == 200 and not self._is_cloudflare_challenge(resp2.text):
+                        log.info("[Handshake] Succeeded after manual solve.")
+                        return resp2
+                    else:
+                        log.warning("[Handshake] Still blocked after manual solve.")
+                else:
+                    # If page loaded content, attempt to fetch JSON via page.evaluate
+                    try:
+                        result_text = await page.evaluate(
+                            """async (u) => {
+                                const r = await fetch(u, { credentials: 'include' });
+                                return await r.text();
+                            }""",
+                            url
+                        )
+                        try:
+                            data = json.loads(result_text)
+                            class SimpleResp2:
+                                def __init__(self, status_code, text, json_data):
+                                    self.status_code = status_code
+                                    self._text = text
+                                    self._json = json_data
+                                def json(self):
+                                    return self._json
+                                @property
+                                def text(self):
+                                    return self._text
+                            return SimpleResp2(200, result_text, data)
+                        except Exception:
+                            class SimpleResp3:
+                                def __init__(self, status_code, text):
+                                    self.status_code = status_code
+                                    self._text = text
+                                def json(self):
+                                    return {}
+                                @property
+                                def text(self):
+                                    return self._text
+                            return SimpleResp3(200, result_text)
+                    except Exception as e:
+                        log.warning("[Handshake] page.evaluate fetch failed: %s", e)
+            finally:
+                try:
+                    await SessionManager.close_context(vis_ctx)
+                except Exception:
+                    pass
+        except Exception as e:
+            log.warning("[Handshake] Visible browser/manual solve flow failed: %s", e)
+
+        return last_resp
+
+    # -------------------------
+    # DOM fallback (Playwright)
+    # -------------------------
+    async def _fallback_scrape(self, context: BrowserContext, keyword: str) -> List[Dict]:
+        log.warning("[Handshake] Falling back to DOM scraping...")
+        results = []
+        try:
+            page = context.pages[0] if context.pages else await context.new_page()
+            search_url = f"{self.BASE_URL}/jobs?query={keyword.replace(' ', '+')}"
+            await page.goto(search_url, wait_until="networkidle", timeout=30000)
+            # If Cloudflare challenge present, return empty
+            html = await page.content()
+            if self._is_cloudflare_challenge(html):
+                log.warning("[Handshake] DOM fallback encountered Cloudflare challenge; returning 0 results.")
+                return results
+
+            cards = page.locator("div[data-test='JobCard'], div.job-card, article.job-card")
+            count = await cards.count()
+            for i in range(count):
+                card = cards.nth(i)
+                try:
+                    title = (await card.locator("h3").inner_text()).strip()
+                except Exception:
+                    title = ""
+                try:
+                    company = (await card.locator("div[data-test='employer-name']").inner_text()).strip()
+                except Exception:
+                    try:
+                        company = (await card.locator(".employer-name").inner_text()).strip()
+                    except Exception:
+                        company = ""
+                try:
+                    href = await card.locator("a").get_attribute("href")
+                    url = f"{self.BASE_URL}{href}" if href and href.startswith("/") else (href or "")
+                except Exception:
+                    url = ""
+                results.append({
+                    "id": url.split("/")[-1] if url else "",
+                    "title": title,
+                    "company": company,
+                    "url": url,
+                    "source": "handshake",
+                    "description": "",
+                })
+        except Exception as e:
+            log.warning("[Handshake] DOM fallback error: %s", e)
+        return results
+
+    # -------------------------
+    # Public scrape() method
+    # -------------------------
+    async def scrape(self, keywords=None, max_items=100) -> List[Dict]:
+        if not keywords:
+            keywords = ["software engineer intern"]
+
+        all_jobs = []
+        # Create a single shared context for the run
+        self._shared_context = await SessionManager.get_context(self.session_name, headless=True)
+        try:
+            # Warm the session once (execute Cloudflare JS in browser)
+            await self._warm_session(self._shared_context)
+            # Load cookies/csrf from warmed context
+            await self._load_cookies_from_browser(self._shared_context)
+
+            for idx, kw in enumerate(keywords):
+                log.info(f"[Handshake] Searching: '{kw}' ({idx+1}/{len(keywords)})")
+                url = (
+                    f"{self.BASE_URL}/jobs?"
+                    f"query={kw.replace(' ', '+')}"
+                    f"&page=1&per_page={max_items}"
+                    f"&job_type_names=Internship%2CPart-Time%2COn-Campus"
+                    f"&sort_direction=desc&sort_column=created_at"
+                    f"&employment_type_names=Internship"
+                )
+
+                # Throttle between keyword requests to avoid rate checks
+                if idx > 0:
+                    delay = 0.6 + random.uniform(0.0, 0.8)
+                    log.debug("[Handshake] Throttling %.2fs before next keyword", delay)
+                    await self._shared_context.wait_for_timeout(int(delay * 1000))
+
+                resp = await self._api_request(self._shared_context, url, max_retries=2)
+
+                jobs_from_api = []
+                if resp is not None and getattr(resp, "status_code", None) == 200:
+                    try:
+                        data = resp.json()
+                        for item in data.get("jobs", []):
+                            jobs_from_api.append({
+                                "id": str(item.get("id")),
+                                "title": item.get("title", "") or "",
+                                "company": item.get("employer_name", "") or "",
+                                "url": f"{self.BASE_URL}/jobs/{item.get('id')}",
+                                "source": "handshake",
+                                "description": item.get("description") or "",
+                            })
+                        log.info(f"[Handshake] API returned {len(jobs_from_api)} jobs for '{kw}'.")
+                        all_jobs.extend(jobs_from_api)
+                        continue
+                    except Exception as e:
+                        log.warning("[Handshake] API JSON parse error: %s", e)
+
+                # If API failed or returned no usable JSON, fallback to DOM scraping
+                fallback = await self._fallback_scrape(self._shared_context, kw)
+                all_jobs.extend(fallback)
+
+        finally:
+            try:
+                await SessionManager.close_context(self._shared_context)
+            except Exception:
+                pass
+            self._shared_context = None
+
+        # Deduplicate
+        seen = set()
+        unique = []
+        for j in all_jobs:
+            jid = j.get("id") or j.get("url") or ""
+            if not jid:
+                continue
+            if jid not in seen:
+                seen.add(jid)
+                unique.append(j)
+        log.info(f"[Handshake] Collected {len(unique)} unique jobs")
+        return unique

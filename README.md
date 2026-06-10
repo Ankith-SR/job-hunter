@@ -286,4 +286,4 @@ PRs and issues welcome.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE)

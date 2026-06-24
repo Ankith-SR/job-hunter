@@ -27,3 +27,6 @@ output/browser_session/
 # OS
 .DS_Store
 Thumbs.db
+
+#Personal details
+materials/resumes/*.pdf
